@@ -1,3 +1,6 @@
 datasets
 tiktoken
 torch
+regex
+numpy
+datasets
