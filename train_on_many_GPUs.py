@@ -55,6 +55,50 @@ def visualise_tokens(token_values: list[bytes]) -> None:
     print("\u001b[0m")
 
 
+# Added from tokenize_dataset.py
+def write_datafile(filename, toks):
+    """ 
+    Saves token data as a .bin file, for reading in C.
+    - First comes a header with 256 int32s
+    - The tokens follow, each as a uint16
+    """
+    assert len(toks) < 2**31, "token count too large" # ~2.1B tokens
+    # construct the header
+    header = np.zeros(256, dtype=np.int32)
+    header[0] = 20240520 # magic
+    header[1] = 1 # version
+    header[2] = len(toks) # number of tokens after the 256*4 bytes of header (each 2 bytes as uint16)
+    # construct the tokens numpy array, if not already
+    if not isinstance(toks, np.ndarray) or not toks.dtype == np.uint16:
+        # validate that no token exceeds a uint16
+        maxtok = 2**16
+        assert all(0 <= t < maxtok for t in toks), "token dictionary too large for uint16"
+        toks_np = np.array(toks, dtype=np.uint16)
+    else:
+        toks_np = toks
+    # write to file
+    print(f"writing {len(toks):,} tokens to {filename}")
+    with open(filename, "wb") as f:
+        f.write(header.tobytes())
+        f.write(toks_np.tobytes())
+
+
+# Added from tokenize_dataset.py
+# Define the tokenizer loading logic as a separate function
+def load_tokenizer(tokenizer_path):
+    tokenizer_config = pickle.load(open(tokenizer_path, 'rb'))
+    enc = tiktoken.Encoding(
+        name=tokenizer_path.split('/')[-1][:-4], # Use filename without extension as name
+        pat_str=tokenizer_config['pat_str'],
+        mergeable_ranks=tokenizer_config['mergeable_ranks'],
+        special_tokens={
+            "<|endoftext|>": len(tokenizer_config['mergeable_ranks']),
+        }
+    )
+    eot = enc._special_tokens['<|endoftext|>']
+    return enc, eot
+
+
 class SimpleBytePairEncoding:
     def __init__(self, *, pat_str: str, mergeable_ranks: dict[bytes, int]) -> None:
         """Creates an Encoding object."""
@@ -223,12 +267,12 @@ def bpe_train(
         dtype=int_type, device=device)
         # shape (words_in_data * (avg_word_len + 1))\
     
-    if master_process and demo:
+    if master_process:
         # Initialize demo text tokens outside the loop to track changes across iterations
         demo_text = (f"This is a test of our custom trained BPE tokenizer on FineWeb data.\n"
                     f"It should handle punctuation, numbers (like 42 and 3.14159), and special characters ($#@!) properly.\n"
                     f"Supercalifragilisticexpialidocious antidisestablishmentarianism!!!")
-        demo_words = [[bytes([b]) for b in word.encode("utf-8")] for word in regex.findall(pat_str, demo_text)]
+        demo_bytes = [[bytes([b]) for b in word.encode("utf-8")] for word in regex.findall(pat_str, demo_text)]
 
     # Now, use our data to figure out which merges we should make
     progress_bar = tqdm(total=vocab_size - 256, unit="merges")
@@ -307,17 +351,16 @@ def bpe_train(
         if master_process:
             progress_bar.update(1)
 
-            if demo:
-                # Also apply the same merge to our demo text
-                demo_words = merge_bytes(demo_words, tuple(best_bytes), token_bytes)
+            # Also apply the same merge to our demo text
+            demo_bytes = merge_bytes(demo_bytes, tuple(best_bytes), token_bytes)
 
-                # See the intermediate merges play out!
-                if j % 1000 == 0 or j in [256, vocab_size - 1]:
-                    print(f"\nThe most common pair {int2nat(best_pair[0])} + {int2nat(best_pair[1])} "
-                            f"which makes {token_bytes} our {len(ranks)}th token")
-                    # Flatten the demo words into a single list of tokens for visualization
-                    demo_tokens = [token for word in demo_words for token in word]
-                    visualise_tokens(demo_tokens)
+            # See the intermediate merges play out!
+            if j % 1000 == 0 or j in [256, vocab_size - 1]:
+                print(f"\nThe most common pair {int2nat(best_pair[0])} + {int2nat(best_pair[1])} "
+                        f"which makes {token_bytes} our {len(ranks)}th token")
+                # Flatten the demo words into a single list of tokens for visualization
+                flattened_demo_bytes = [token for word in demo_bytes for token in word]
+                visualise_tokens(flattened_demo_bytes)
     
     print(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
             f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB")
@@ -462,7 +505,7 @@ def train_simple_encoding(sample_size: int, vocab_size: int, k: int = 256):
     return enc
 
 
-def save_tokenizer(enc, name, vocab_size, sample_size):
+def save_tokenizer(enc, vocab_size, sample_size):
     """Save the tokenizer for later use"""
     # Ensure the directory exists
     os.makedirs('tokenizers', exist_ok=True)
@@ -483,26 +526,11 @@ def save_tokenizer(enc, name, vocab_size, sample_size):
     print(f"Tokenizer saved to {full_filename}")
 
 
-# Define the tokenizer loading logic as a separate function
-def load_tokenizer(tokenizer_path):
-    tokenizer_config = pickle.load(open(tokenizer_path, 'rb'))
-    enc = tiktoken.Encoding(
-        name=tokenizer_path.split('/')[-1][:-4], # Use filename without extension as name
-        pat_str=tokenizer_config['pat_str'],
-        mergeable_ranks=tokenizer_config['mergeable_ranks'],
-        special_tokens={
-            "<|endoftext|>": len(tokenizer_config['mergeable_ranks']),
-        }
-    )
-    eot = enc._special_tokens['<|endoftext|>']
-    return enc, eot
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train a custom BPE tokenizer")
-    parser.add_argument("-n", "--samples", type=int, default=2**27, 
+    parser.add_argument("-n", "--samples", type=int, default=world_size * (2**27), 
         help=(f"Maximum number of text characters to use (across all GPUs)"
-            f" for training (default 2^27 should fit on single GPU with 8gb of VRAM)"))
+            f" for training (2^27 should fit on single GPU with 8gb of VRAM)"))
     parser.add_argument("-v", "--vocabsize", type=int, default=65534, 
         help="Size of the vocabulary to train (default 65,534 to saturate int16)")
     args = parser.parse_args()
@@ -519,13 +547,13 @@ if __name__ == "__main__":
     
     # Save the tokenizer
     if master_process:
-        save_tokenizer(enc, args.name, args.vocabsize, args.samples)
+        save_tokenizer(enc, args.vocabsize, args.samples)
 
         # Demonstrate the tokenizer usage
         print("\nDemonstrating tokenizer usage:")
         
         # Use the tokenizer with the known vocab size and sample size
-        tokenizer_filename = f"GPU_v{args.vocabsize}_n{args.samples}.pkl"
+        tokenizer_filename = f"multiple_GPUs_v{args.vocabsize}_n{args.samples}.pkl"
         data_dir = os.path.join(os.path.dirname(__file__), "tokenizers")
         tokenizer_path = os.path.join(data_dir, tokenizer_filename)
         
