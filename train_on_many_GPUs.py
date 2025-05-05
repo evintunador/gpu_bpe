@@ -19,6 +19,8 @@ from itertools import chain
 import multiprocessing as mp
 import glob
 from functools import partial, lru_cache
+import re
+import datetime
 
 import torch
 import torch.distributed as dist
@@ -32,8 +34,9 @@ print(f"Running with {world_size} GPU(s)")
 assert torch.cuda.is_available()
 device = torch.device("cuda", local_rank)
 torch.cuda.set_device(device)
-# Initialize distributed process group
-dist.init_process_group(backend="nccl", device_id=device)
+# Initialize distributed process group with a longer than default timeout to account for dataset downloading
+timeout_delta = datetime.timedelta(hours=1)
+dist.init_process_group(backend="nccl", device_id=device, timeout=timeout_delta)
 dist.barrier()
 master_process = (rank == 0)  # this process will do logging, checkpointing etc.
 
@@ -142,15 +145,15 @@ class SimpleBytePairEncoding:
         """Train a BPE tokeniser using data loaded from shards."""
         
         # Determine torch int_type based on vocab_size
-        int_type = torch.int16 if vocab_size <= (2**15)-1 else torch.int32 
-        assert vocab_size <= (2**31)-1, f"Vocab size {vocab_size} too large"
+        torch_dtype = torch.int16 if vocab_size <= (2**16)-2 else torch.int32
+        assert vocab_size <= (2**32)-1, f"Vocab size {vocab_size} too large"
         # Ensure torch and numpy types are consistent
-        assert (int_type == torch.int16 and np_dtype == np.int16) or \
-               (int_type == torch.int32 and np_dtype == np.int32), \
-               f"Mismatch between torch type {int_type} and numpy type {np_dtype}"
+        assert (torch_dtype == torch.int16 and np_dtype == np.int16) or \
+               (torch_dtype == torch.int32 and np_dtype == np.int32), \
+               f"Mismatch between torch type {torch_dtype} and numpy type {np_dtype}"
 
-        # Load data from shards - pass np_dtype for reading, int_type for final tensor
-        ids = load_from_shards(data_dir, np_dtype, int_type) 
+        # Load data from shards - pass np_dtype for reading, torch_dtype for final tensor
+        ids = load_from_shards(data_dir, np_dtype, torch_dtype)
 
         # Pass the loaded tensor and pat_str (for demo) to bpe_train
         mergeable_ranks = bpe_train(
@@ -158,7 +161,7 @@ class SimpleBytePairEncoding:
             vocab_size=vocab_size, 
             pat_str=pat_str, # Pass pat_str for demo purposes
             k=k,
-            int_type=int_type # Pass torch int_type
+            torch_dtype=torch_dtype # Pass torch dtype
             ) 
         return SimpleBytePairEncoding(pat_str=pat_str, mergeable_ranks=mergeable_ranks)
 
@@ -217,7 +220,7 @@ def int2nat(num: int):
 
 
 def bpe_train(
-    ids: torch.Tensor, vocab_size: int, pat_str: str, k: int = 256, int_type: torch.dtype = torch.int16
+    ids: torch.Tensor, vocab_size: int, pat_str: str, k: int = 256, torch_dtype: torch.dtype = torch.int16
 ) -> dict[bytes, int]:
     # First, add tokens for each individual byte value
     if vocab_size < 2**8:
@@ -229,7 +232,7 @@ def bpe_train(
     id_to_bytes = {i: bytes([i]) for i in range(2**8)} 
     
     # set indicator tokens for merging ops
-    type_info = torch.iinfo(int_type)
+    type_info = torch.iinfo(torch_dtype)
     SEPARATOR_TOKEN = type_info.min
     REMOVE_TOKEN = type_info.max
     
@@ -303,9 +306,18 @@ def bpe_train(
             bytes_0 = id_to_bytes[best_pair_nat[0]]
             bytes_1 = id_to_bytes[best_pair_nat[1]]
         except KeyError as e:
-             print(f"Error: Could not find bytes for natural ID {e}. This shouldn't happen.")
-             print(f"Attempted lookup for pair: signed={best_pair_signed}, natural={best_pair_nat}")
-             continue # Skip this merge iteration
+             if master_process:
+                 print(f"\nRank {rank} Error: Could not find bytes for natural ID {e} at merge step {j}. This shouldn't happen.")
+                 print(f"Attempted lookup for pair: signed={best_pair_signed}, natural={best_pair_nat}")
+                 print(f"Available natural IDs in id_to_bytes: {len(id_to_bytes)}")
+                 # Optional: print some recent additions to id_to_bytes
+                 last_added_ids = sorted(list(id_to_bytes.keys()))[-5:]
+                 print(f"Last 5 natural IDs added: {last_added_ids}")
+                 print(f"Bytes for last 5: {[id_to_bytes[id] for id in last_added_ids]}")
+             # Depending on severity, either continue or raise/break
+             # Let's continue for now, skipping this merge
+             progress_bar.update(1) # Still update progress bar even if skipping
+             continue 
 
         token_bytes = bytes_0 + bytes_1
         new_token_id_nat = len(ranks) # Natural ID for the new token (0, 1, 2...)
@@ -403,222 +415,303 @@ def tokenize_worker(doc_ids, np_dtype):
     return tokens
 
 
-def fetch_fineweb_data(vocab_size: int, pat_str: str, max_chars: int = 2**22, shard_size: int = 10**8):
-    """Fetch data, tokenize with separators using correct signed types, and save shards."""
+def fetch_fineweb_data(
+    vocab_size: int, 
+    pat_str: str, 
+    max_chars: int, 
+    shard_size: int,
+    ):
+    """
+    Fetch data, tokenize with separators using correct signed types, and save shards.
+    Checks if suitable shards from a previous run exist based on dtype and max_chars in the filename.
+    """
     data_dir = os.path.join(os.path.dirname(__file__), "data")
     os.makedirs(data_dir, exist_ok=True)
     
-    # Determine int_type and numpy equivalent based on vocab_size
-    if vocab_size <= (2**15) - 1:
-        int_type = torch.int16
+    # Determine torch_dtype and numpy equivalent based on vocab_size
+    if vocab_size <= (2**16) - 2:
+        torch_dtype = torch.int16
         np_dtype = np.int16
         SEPARATOR_TOKEN = torch.iinfo(torch.int16).min # Usually -32768
-    elif vocab_size <= (2**31) - 1:
-        int_type = torch.int32
+    elif vocab_size <= (2**32) - 2:
+        torch_dtype = torch.int32
         np_dtype = np.int32
         SEPARATOR_TOKEN = torch.iinfo(torch.int32).min # Usually -2147483648
     else:
          raise ValueError(f"vocab_size {vocab_size} too large for supported types")
 
-    print(f"Using {int_type} (numpy: {np_dtype}) for tokens. SEPARATOR_TOKEN={SEPARATOR_TOKEN}")
-
-    # File naming pattern for byte shards
-    shard_pattern = os.path.join(data_dir, f"fineweb_{np_dtype.__name__}_" + "{index:06d}.bin")
-
-    # --- Master process handles downloading and processing ---
     if rank == 0:
-        # TODO: Add logic to check if shards totaling >= target_bytes already exist
-        # TODO: Add logic to clean up old/incomplete shards if resuming
+        print(f"Using {torch_dtype} (numpy: {np_dtype}) for tokens. SEPARATOR_TOKEN={SEPARATOR_TOKEN}")
 
-        print(f"Master process downloading and tokenizing FineWeb data (target: {max_chars:,} chars)...")
-        
-        dataset = load_dataset("HuggingFaceFW/fineweb", 
-                              name="sample-100BT",
-                              split="train", 
-                              streaming=True)
-        
-        nprocs = max(1, os.cpu_count() - 2)
-        print(f"Using {nprocs} processes for tokenization.")
-        
-        total_bytes_written = 0
-        shard_index = 0
-        current_shard_bytes = 0
-        current_shard_fh = None 
+    # --- Define shard filename pattern including max_chars ---
+    # Example: fineweb_int32_10000000_000000.bin
+    shard_filename_template = f"fineweb_{np_dtype.__name__}_{max_chars}_" + "{index:06d}.bin"
+    shard_pattern = os.path.join(data_dir, shard_filename_template) # For writing new shards
 
-        # --- Function to open the next shard file ---
-        def open_next_shard():
-            nonlocal current_shard_fh, shard_index, current_shard_bytes
+    # --- Master process handles checking/downloading/processing ---
+    skip_processing = False
+    if rank == 0:
+        # --- Check for existing suitable shards ---
+        print("Checking for existing suitable shards...")
+        # Pattern to find shards with the correct dtype and *at least* the required max_chars
+        existing_shard_glob = os.path.join(data_dir, f"fineweb_{np_dtype.__name__}_*_*.bin")
+        potential_shards = glob.glob(existing_shard_glob)
+        
+        found_suitable_shards = False
+        if potential_shards:
+            # Regex to parse dtype, max_chars, and index from filename
+            filename_regex = re.compile(rf"fineweb_{np_dtype.__name__}_(\d+)_(\d+)\.bin$")
+            
+            for shard_path in potential_shards:
+                match = filename_regex.search(os.path.basename(shard_path))
+                if match:
+                    existing_max_chars = int(match.group(1))
+                    # Check if existing shards were created with at least the required characters
+                    if existing_max_chars >= max_chars:
+                        print(f"Found suitable existing shard: {shard_path} (created with {existing_max_chars} chars)")
+                        found_suitable_shards = True
+                        # We only need one match to confirm suitability based on filename convention
+                        break 
+
+        if found_suitable_shards:
+            print(f"Found existing shards for {np_dtype.__name__} with >= {max_chars:,} characters. Skipping download and processing.")
+            skip_processing = True
+        else:
+            print("No suitable existing shards found. Proceeding with download and processing.")
+            # Optional: Clean up old shards with the same dtype but smaller max_chars?
+            cleanup_glob = os.path.join(data_dir, f"fineweb_{np_dtype.__name__}_*_*.bin")
+            for old_shard in glob.glob(cleanup_glob):
+                try:
+                    filename_max_chars = int(re.search(r'_(\d+)_', os.path.basename(old_shard)).group(1))
+                    if filename_max_chars < max_chars:
+                        print(f"Removing old/smaller shard: {old_shard}")
+                        os.remove(old_shard)
+                except (AttributeError, IndexError, ValueError):
+                    print(f"Could not parse max_chars from {old_shard}, skipping cleanup.")
+                except OSError as e:
+                    print(f"Error removing {old_shard}: {e}")
+
+        # --- Download and process only if necessary ---
+        if not skip_processing:
+            print(f"Master process downloading and tokenizing FineWeb data (target: {max_chars:,} chars)...")
+            
+            dataset = load_dataset("HuggingFaceFW/fineweb", 
+                                  name="sample-100BT",
+                                  split="train", 
+                                  streaming=True)
+            
+            nprocs = max(1, os.cpu_count() - 2)
+            print(f"Using {nprocs} processes for dataset downloading and byte-level pre-tokenization")
+            
+            total_bytes_written = 0
+            shard_index = 0
+            current_shard_bytes = 0
+            current_shard_fh = None 
+
+            # --- Function to open the next shard file (uses the template) ---
+            def open_next_shard():
+                nonlocal current_shard_fh, shard_index, current_shard_bytes
+                if current_shard_fh is not None:
+                    current_shard_fh.close()
+                # Use the shard_pattern which includes the target max_chars
+                shard_filename = shard_pattern.format(index=shard_index) 
+                #print(f"Opening shard file: {shard_filename}")
+                current_shard_fh = open(shard_filename, "wb")
+                current_shard_bytes = 0
+                shard_index += 1
+
+            # Initial byte ranks (0-255)
+            ranks = {bytes([i]): i for i in range(2**8)}
+
+            # Pass np_dtype to the worker function via partial or modify worker
+            tokenize_partial = partial(tokenize_worker, np_dtype=np_dtype) 
+
+            with mp.Pool(nprocs) as pool, tqdm(total=max_chars, unit="chars", desc="Processing chars") as pbar:
+                chars_processed_so_far = 0
+                doc_iterator = iter(dataset)
+                
+                open_next_shard() # Open the very first shard file
+
+                while chars_processed_so_far < max_chars:
+                    # Fetch a batch of documents to reduce overhead
+                    batch_size = nprocs * 16 # Heuristic batch size
+                    docs_batch_for_pool = [] # Prepare list of lists for the pool
+                    batch_char_count = 0
+                    try:
+                        for _ in range(batch_size):
+                            doc = next(doc_iterator)["text"]
+                            doc_len = len(doc)
+
+                            at_end = chars_processed_so_far + batch_char_count + doc_len >= max_chars
+                            current_doc_char_limit = doc_len
+                            
+                            if at_end:
+                                # Add partial document if needed to reach max_chars exactly
+                                remaining_chars = max_chars - (chars_processed_so_far + batch_char_count)
+                                if remaining_chars <= 0: # Already reached or exceeded max_chars
+                                    chars_processed_so_far = max_chars # Ensure loop terminates
+                                    break # Break inner loop - don't process this doc
+                                doc = doc[:remaining_chars]
+                                current_doc_char_limit = remaining_chars
+                                batch_char_count += remaining_chars
+                            else:
+                                batch_char_count += doc_len
+
+                            # Splinter up our data into lists of bytes based on the regex pattern
+                            words: list[list[bytes]] = [
+                                [bytes([b]) for b in word.encode("utf-8")] for word in regex.findall(pat_str, doc)
+                            ]
+                            # Create a list to store numeric token IDs for tensor operations
+                            # Initially, these are just byte values (0-255)
+                            byte_ids_lofl = [[ranks[b] for b in word] for word in words]
+                            # convert from (0,1,2,3...) to (0,-1,1,-2,2,...) to saturate int dtype (pytorch doesn't support uint well)
+                            ids_lofl = [[nat2int(num) for num in sublist] for sublist in byte_ids_lofl] 
+                            # Use the correct SEPARATOR_TOKEN value
+                            ids = list(chain.from_iterable(word + [SEPARATOR_TOKEN] for word in ids_lofl)) 
+                            # Append the list of signed IDs to the batch for the pool
+                            docs_batch_for_pool.append(ids)
+                            
+                            if at_end:
+                                chars_processed_so_far = max_chars # Ensure loop terminates correctly
+                                break # Stop fetching more docs for this batch
+                                
+                    except StopIteration:
+                        # Dataset finished before reaching max_chars
+                        # Update chars_processed_so_far accurately before breaking outer loop
+                        chars_processed_so_far += batch_char_count 
+                        print(f"\nDataset finished before reaching target {max_chars:,} characters. Processed {chars_processed_so_far:,} chars.")
+                        # Ensure pbar reflects the actual processed count if ending early
+                        pbar.n = chars_processed_so_far 
+                        pbar.refresh() 
+                        break # Break outer loop
+
+                    if not docs_batch_for_pool:
+                        if chars_processed_so_far >= max_chars: # Check if loop should terminate
+                             break 
+                        # This case might occur if the first doc itself is > max_chars or StopIteration happened immediately
+                        print("Warning: No documents processed in a batch cycle.")
+                        continue # Or break, depending on desired behavior
+
+                    # Process the batch using imap_unordered and write results to shards
+                    try:
+                        for tokens_array in pool.imap_unordered(tokenize_partial, docs_batch_for_pool):
+                            bytes_to_write = tokens_array.nbytes
+                            
+                            while bytes_to_write > 0:
+                                space_left_in_shard = shard_size - current_shard_bytes
+                                
+                                bytes_in_chunk = min(bytes_to_write, space_left_in_shard)
+                                elements_in_chunk = bytes_in_chunk // tokens_array.itemsize
+
+                                if elements_in_chunk > 0:
+                                    # Get the slice of the numpy array corresponding to the chunk
+                                    data_chunk = tokens_array[:elements_in_chunk]
+                                    current_shard_fh.write(data_chunk.tobytes())
+                                    current_shard_bytes += data_chunk.nbytes
+                                    total_bytes_written += data_chunk.nbytes
+                                    
+                                    # Prepare the remainder
+                                    tokens_array = tokens_array[elements_in_chunk:]
+                                    bytes_to_write -= data_chunk.nbytes
+                                
+                                # Check if the shard is full or if we finished writing this array
+                                if current_shard_bytes >= shard_size or bytes_to_write == 0:
+                                    if current_shard_bytes >= shard_size:
+                                         open_next_shard()
+                                    # If bytes_to_write > 0, the loop continues with the new shard
+
+                    except Exception as e:
+                        print(f"Error during tokenization/writing: {e}")
+                        # Decide how to handle errors, e.g., stop or log and continue
+                        if current_shard_fh: current_shard_fh.close()
+                        raise 
+
+                    # Update progress based on characters *intended* for this batch
+                    pbar.update(batch_char_count) 
+                    chars_processed_so_far += batch_char_count
+
+            # Close the last shard file if it's open
             if current_shard_fh is not None:
                 current_shard_fh.close()
-            shard_filename = shard_pattern.format(index=shard_index)
-            print(f"Opening shard file: {shard_filename}")
-            current_shard_fh = open(shard_filename, "wb")
-            current_shard_bytes = 0
-            shard_index += 1 # Increment index for the *next* shard
+                print(f"Closing final shard file.")
 
-        # Initial byte ranks (0-255)
-        ranks = {bytes([i]): i for i in range(2**8)}
+            print(f"Master process finished targeting {max_chars:,} characters.")
+            print(f"Total bytes written to shards: {total_bytes_written:,}")
+            # TODO: Signal completion or write metadata about shards
 
-        # Pass np_dtype to the worker function via partial or modify worker
-        tokenize_partial = partial(tokenize_worker, np_dtype=np_dtype) 
+    # Add a barrier *after* the broadcast to ensure all ranks know whether to proceed
+    dist.barrier() 
 
-        with mp.Pool(nprocs) as pool, tqdm(total=max_chars, unit="chars", desc="Processing chars") as pbar:
-            chars_processed_so_far = 0
-            doc_iterator = iter(dataset)
-            
-            open_next_shard() # Open the very first shard file
-
-            while chars_processed_so_far < max_chars:
-                # Fetch a batch of documents to reduce overhead
-                batch_size = nprocs * 16 # Heuristic batch size
-                docs_batch_for_pool = [] # Prepare list of lists for the pool
-                batch_char_count = 0
-                try:
-                    for _ in range(batch_size):
-                        doc = next(doc_iterator)["text"]
-                        doc_len = len(doc)
-
-                        at_end = chars_processed_so_far + batch_char_count + doc_len >= max_chars
-                        current_doc_char_limit = doc_len
-                        
-                        if at_end:
-                            # Add partial document if needed to reach max_chars exactly
-                            remaining_chars = max_chars - (chars_processed_so_far + batch_char_count)
-                            if remaining_chars <= 0: # Already reached or exceeded max_chars
-                                chars_processed_so_far = max_chars # Ensure loop terminates
-                                break # Break inner loop - don't process this doc
-                            doc = doc[:remaining_chars]
-                            current_doc_char_limit = remaining_chars
-                            batch_char_count += remaining_chars
-                        else:
-                            batch_char_count += doc_len
-
-                        # Splinter up our data into lists of bytes based on the regex pattern
-                        words: list[list[bytes]] = [
-                            [bytes([b]) for b in word.encode("utf-8")] for word in regex.findall(pat_str, doc)
-                        ]
-                        # Create a list to store numeric token IDs for tensor operations
-                        # Initially, these are just byte values (0-255)
-                        byte_ids_lofl = [[ranks[b] for b in word] for word in words]
-                        # convert from (0,1,2,3...) to (0,-1,1,-2,2,...) to saturate int dtype (pytorch doesn't support uint well)
-                        ids_lofl = [[nat2int(num) for num in sublist] for sublist in byte_ids_lofl] 
-                        # Use the correct SEPARATOR_TOKEN value
-                        ids = list(chain.from_iterable(word + [SEPARATOR_TOKEN] for word in ids_lofl)) 
-                        # Append the list of signed IDs to the batch for the pool
-                        docs_batch_for_pool.append(ids)
-                        
-                        if at_end:
-                            chars_processed_so_far = max_chars # Ensure loop terminates correctly
-                            break # Stop fetching more docs for this batch
-                            
-                except StopIteration:
-                    # Dataset finished before reaching max_chars
-                    chars_processed_so_far += batch_char_count
-                    break # Break outer loop
-
-                if not docs_batch_for_pool:
-                    if chars_processed_so_far >= max_chars: # Check if loop should terminate
-                         break 
-                    # This case might occur if the first doc itself is > max_chars
-                    print("Warning: No documents processed in a batch cycle.")
-                    continue # Or break, depending on desired behavior
-
-                # Process the batch using imap_unordered and write results to shards
-                try:
-                    for tokens_array in pool.imap_unordered(tokenize_partial, docs_batch_for_pool):
-                        bytes_to_write = tokens_array.nbytes
-                        
-                        # Write to current shard, potentially splitting across shards
-                        while bytes_to_write > 0:
-                            space_left_in_shard = shard_size - current_shard_bytes
-                            
-                            bytes_in_chunk = min(bytes_to_write, space_left_in_shard)
-                            elements_in_chunk = bytes_in_chunk // tokens_array.itemsize
-
-                            if elements_in_chunk > 0:
-                                # Get the slice of the numpy array corresponding to the chunk
-                                data_chunk = tokens_array[:elements_in_chunk]
-                                current_shard_fh.write(data_chunk.tobytes())
-                                current_shard_bytes += data_chunk.nbytes
-                                total_bytes_written += data_chunk.nbytes
-                                
-                                # Prepare the remainder
-                                tokens_array = tokens_array[elements_in_chunk:]
-                                bytes_to_write -= data_chunk.nbytes
-                            
-                            # Check if the shard is full or if we finished writing this array
-                            if current_shard_bytes >= shard_size or bytes_to_write == 0:
-                                if current_shard_bytes >= shard_size:
-                                     open_next_shard()
-                                # If bytes_to_write > 0, the loop continues with the new shard
-
-                except Exception as e:
-                    print(f"Error during tokenization/writing: {e}")
-                    # Decide how to handle errors, e.g., stop or log and continue
-                    if current_shard_fh: current_shard_fh.close()
-                    raise 
-
-                # Update progress based on characters *intended* for this batch
-                # Note: Actual chars processed might be slightly less if ended early
-                pbar.update(batch_char_count) 
-
-        # Close the last shard file if it's open
-        if current_shard_fh is not None:
-            current_shard_fh.close()
-            print(f"Closing final shard file.")
-
-        print(f"Master process finished targeting {max_chars:,} characters.")
-        print(f"Total bytes written to shards: {total_bytes_written:,}")
-        # TODO: Signal completion or write metadata about shards
-
-    # --- All processes wait here ---
-    dist.barrier()
-    print(f"Rank {rank} finished waiting for data preparation.")
+    # Broadcast the skip_processing flag from rank 0 to all other ranks
+    skip_processing_tensor = torch.tensor(int(skip_processing), dtype=torch.int, device=device)
+    dist.broadcast(skip_processing_tensor, src=0)
+    skip_processing = bool(skip_processing_tensor.item()) # Convert back to boolean
+    
+    if not skip_processing:
+        print(f"Rank {rank} finished data preparation.")
+    else:
+        print(f"Rank {rank} skipped data preparation, using existing shards.")
     
     # Return the directory and the determined numpy dtype for loading
     return data_dir, np_dtype 
 
 
-def load_from_shards(data_dir: str, np_dtype: np.dtype, int_type: torch.dtype, chunk_size: int = 10 * 1024 * 1024) -> torch.Tensor:
-    """Loads signed token data incrementally from shards."""
-    # Use the dtype name in the pattern to find the correct files
-    shard_pattern = os.path.join(data_dir, f"fineweb_{np_dtype.__name__}_*.bin") 
-    shard_files = sorted(glob.glob(shard_pattern))
+def load_from_shards(data_dir: str, np_dtype: np.dtype, torch_dtype: torch.dtype, chunk_size: int = 10 * 1024 * 1024) -> torch.Tensor:
+    """Loads signed token data incrementally from shards matching the dtype."""
+    # Use a glob pattern that matches the dtype but ignores max_chars and index for loading flexibility
+    # This assumes we only care about loading *any* shards of the correct dtype found in the directory
+    # It relies on fetch_fineweb_data having either created the correct ones or confirmed suitable ones exist.
+    shard_pattern_glob = os.path.join(data_dir, f"fineweb_{np_dtype.__name__}_*_*.bin") 
+    shard_files = sorted(glob.glob(shard_pattern_glob))
 
     if not shard_files:
-        raise FileNotFoundError(f"No shard files found matching {shard_pattern}")
+        # This should ideally not happen if fetch_fineweb_data ran correctly
+        raise FileNotFoundError(f"Rank {rank}: No shard files found matching {shard_pattern_glob}")
 
     # Distribute shards among ranks
     files_for_rank = shard_files[rank::world_size]
 
     if not files_for_rank:
+        # It's possible for some ranks to have no files if world_size > num_shards
         raise ValueError(f"Rank {rank} has no shards assigned.")
 
-    print(f"Rank {rank} loading {len(files_for_rank)} shards ({np_dtype.__name__}) in chunks of {chunk_size // 1024 // 1024} MiB...")
+    if master_process: # Print only from rank 0 for clarity
+        print(f"Loading data from {len(shard_files)} shards ({np_dtype.__name__}) matching glob '{os.path.basename(shard_pattern_glob)}'...")
+    print(f"Rank {rank} loading {len(files_for_rank)} shards.")
 
-    all_tensor_chunks = [] # Store tensor chunks from all files for this rank
-    total_bytes = 0
+    all_tensor_chunks = []
+    total_tokens = 0 
     
-    for filename in tqdm(files_for_rank, desc=f"Rank {rank} loading shards"):
-        try:
-            # Ensure chunk size is a multiple of item size for clean reads
-            item_size = np.dtype(np_dtype).itemsize
-            adjusted_chunk_size = (chunk_size // item_size) * item_size
-            if adjusted_chunk_size == 0: # Handle very small chunk sizes
-                 adjusted_chunk_size = item_size
+    # Use the provided chunk_size
+    item_size = np.dtype(np_dtype).itemsize
+    adjusted_chunk_size = (chunk_size // item_size) * item_size
+    if adjusted_chunk_size == 0:
+            adjusted_chunk_size = item_size
+            if master_process:
+                 print(f"Warning: Provided chunk_size {chunk_size} is smaller than item size {item_size}. Using chunk_size={item_size}.")
 
+
+    for filename in tqdm(files_for_rank, desc=f"Rank {rank} reading shards", disable=not master_process):
+        try:
             with open(filename, "rb") as f:
                 while True:
                     chunk_bytes = f.read(adjusted_chunk_size)
                     if not chunk_bytes:
-                        break # End of file
+                        break 
+                    
+                    # Ensure we read a multiple of item_size bytes
+                    if len(chunk_bytes) % item_size != 0:
+                        print(f"Warning: Rank {rank} read {len(chunk_bytes)} bytes from {filename}, not a multiple of item size {item_size}. Possible data truncation.")
+                        # Adjust chunk_bytes to be a multiple of item_size if possible
+                        num_items = len(chunk_bytes) // item_size
+                        chunk_bytes = chunk_bytes[:num_items * item_size]
+                        if not chunk_bytes: break # Stop if adjusted size is zero
 
-                    # Convert bytes directly using the correct signed numpy dtype
                     token_data_np = np.frombuffer(chunk_bytes, dtype=np_dtype)
-                    total_tokens += len(token_data_np)
+                    total_tokens += len(token_data_np) # Count tokens loaded
                     
                     # Convert numpy array to torch tensor directly on the GPU with the target torch int_type
-                    tensor_chunk = torch.from_numpy(token_data_np).to(device=device, dtype=int_type)
+                    tensor_chunk = torch.from_numpy(token_data_np).to(device=device, dtype=torch_dtype)
                     all_tensor_chunks.append(tensor_chunk)
                     
                     # Optional: Add a small sleep or yield if I/O is overwhelming other processes,
@@ -633,16 +726,24 @@ def load_from_shards(data_dir: str, np_dtype: np.dtype, int_type: torch.dtype, c
     if not all_tensor_chunks:
         raise ValueError(f"Rank {rank} - No data loaded.")
         
-    # Concatenate all tensor chunks ONCE
+    # Concatenate all tensor chunks
     ids = torch.cat(all_tensor_chunks)
-    all_tensor_chunks = [] 
-    # total_bytes = total_tokens * item_size # Calculate total bytes loaded
-    print(f"Rank {rank} loaded {total_tokens:,} tokens (including separators) -> tensor shape {ids.shape} ({ids.dtype})")
+    print(f"Rank {rank} loaded {total_tokens:,} tokens -> tensor shape {ids.shape} ({ids.dtype})")
+
+    # Barrier to ensure all ranks finish loading before proceeding
+    dist.barrier()
+    if master_process: print("All ranks finished loading data.")
 
     return ids
 
 
-def train_simple_encoding(sample_size: int, vocab_size: int, k: int = 256):
+def train_simple_encoding(
+    sample_size: int, 
+    vocab_size: int, 
+    k: int, 
+    pat_str: str,
+    shard_size: int,
+    ):
     """
     Train a custom BPE tokenizer using FineWeb data.
     
@@ -650,25 +751,25 @@ def train_simple_encoding(sample_size: int, vocab_size: int, k: int = 256):
         sample_size: maximum number of characters to include in data
         vocab_size: Size of the vocabulary to train
         k: number of pairs to compare across GPUs
+        pat_str: regex pattern string for splitting text
+        shard_size: size of each data shard in bytes
     
     Returns:
         The trained tokenizer
     """
-    #gpt2_pattern = (r"""'s|'t|'re|'ve|'m|'ll|'d| ?[\p{L}]+| ?[\p{N}]+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+""")
-    gpt4_pattern = (
-        r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
-    )
-
-    # Pass vocab_size to fetch_fineweb_data
-    data_dir, np_dtype = fetch_fineweb_data(vocab_size=vocab_size, pat_str=gpt4_pattern, max_chars=sample_size)
+    data_dir, np_dtype = fetch_fineweb_data(
+        vocab_size=vocab_size, 
+        pat_str=pat_str, 
+        max_chars=sample_size,
+        shard_size=shard_size,
+        )
     
-    # Pass data_dir, vocab_size, pattern, np_dtype (for loading) to train
     enc = SimpleBytePairEncoding.train(
         data_dir=data_dir, 
         vocab_size=vocab_size, 
-        pat_str=gpt4_pattern, 
+        pat_str=pat_str, 
         k=k, 
-        np_dtype=np_dtype
+        np_dtype=np_dtype,
         )
     
     # Test the tokenizer with a simple example
@@ -706,12 +807,17 @@ def save_tokenizer(enc, vocab_size, sample_size):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train a custom BPE tokenizer")
+    # Default GPT-4 pattern
+    gpt4_pattern_default = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+    
+    parser = argparse.ArgumentParser(description="Train a custom BPE tokenizer on multiple GPUs")
     parser.add_argument("-n", "--samples", type=int, default=world_size * (2**27), 
-        help=(f"Maximum number of text characters to use (across all GPUs)"
-            f" for training (2^27 should fit on single GPU with 8gb of VRAM)"))
-    parser.add_argument("-v", "--vocabsize", type=int, default=65534, 
-        help="Size of the vocabulary to train (default 65,534 to saturate int16)")
+        help=(f"Maximum number of text characters to process across all GPUs for training (default: {world_size} * 2^27 assumes 8GB of VRAM)"))
+    parser.add_argument("-v", "--vocabsize", type=int, default=(2**16)-2, 
+        help="Size of the vocabulary to train (default (2^16)-2 to saturate int16)")
+    parser.add_argument("--pat_str", type=str, default=gpt4_pattern_default, 
+        help="Regex pattern string for splitting text (defaults to GPT4's)")
+    parser.add_argument("--shard_size", type=int, default=10**7, help="Target size of each data shard in bytes (default: 10,000,000)")
     args = parser.parse_args()
 
     # this is the number of top-k unique pairs set to be communicated between GPUs
@@ -721,12 +827,18 @@ if __name__ == "__main__":
     enc = train_simple_encoding(
         sample_size=args.samples,
         vocab_size=args.vocabsize,
-        k=k
+        k=k,
+        pat_str=args.pat_str,
+        shard_size=args.shard_size,
     )
     
     # Save the tokenizer
     if master_process:
-        save_tokenizer(enc, args.vocabsize, args.samples)
+        save_tokenizer(
+            enc, 
+            args.vocabsize, 
+            args.samples, 
+        )
 
         # Demonstrate the tokenizer usage
         print("\nDemonstrating tokenizer usage:")
@@ -765,5 +877,3 @@ if __name__ == "__main__":
                 print(f"Token {token} → '{enc.decode([token])}'")
 
     dist.destroy_process_group()
-        
-    
